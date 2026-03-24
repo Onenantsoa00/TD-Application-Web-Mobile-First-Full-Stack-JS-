@@ -2,14 +2,70 @@
 import { ref, onMounted } from "vue";
 
 const cards = ref([]);
+let db;
 
-const fetchData = async () => {
-  const res = await fetch("http://localhost:3000/api/data");
-  const data = await res.json();
-  cards.value = data;
+// Initialiser IndexedDB
+const initDB = () => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("DashboardDB", 1);
+
+    request.onupgradeneeded = (event) => {
+      db = event.target.result;
+      db.createObjectStore("cards", { keyPath: "id", autoIncrement: true });
+    };
+
+    request.onsuccess = (event) => {
+      db = event.target.result;
+      resolve(db);
+    };
+
+    request.onerror = (event) => reject(event);
+  });
 };
 
-onMounted(fetchData);
+// Sauvegarder données
+const saveToDB = (data) => {
+  const tx = db.transaction("cards", "readwrite");
+  const store = tx.objectStore("cards");
+
+  store.clear(); // éviter doublons
+  data.forEach((item) => store.add(item));
+};
+
+// Lire données
+const getFromDB = () => {
+  return new Promise((resolve) => {
+    const tx = db.transaction("cards", "readonly");
+    const store = tx.objectStore("cards");
+    const request = store.getAll();
+
+    request.onsuccess = () => resolve(request.result);
+  });
+};
+
+// Fetch + fallback offline
+const fetchData = async () => {
+  try {
+    const res = await fetch("http://localhost:3000/api/data");
+    const data = await res.json();
+
+    cards.value = data;
+    saveToDB(data);
+
+    console.log(" Données depuis API");
+  } catch (error) {
+    console.log(" Offline → chargement depuis IndexedDB");
+
+    const localData = await getFromDB();
+    cards.value = localData;
+  }
+};
+
+//  Au démarrage
+onMounted(async () => {
+  await initDB();
+  fetchData();
+});
 </script>
 
 <template>

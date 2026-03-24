@@ -8,7 +8,7 @@ app.get("/api/data", (req, res) => {
   res.json([
     { title: "Carte 1", content: "Contenu mobile-first" },
     { title: "Carte 2", content: "Données depuis Node.js" },
-    { title: "Carte 3", content: "Vue + Express " },
+    { title: "Carte 3", content: "Vue + Express" },
   ]);
 });
 
