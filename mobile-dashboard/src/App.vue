@@ -1,5 +1,9 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, onMounted, nextTick } from "vue";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+import { io } from "socket.io-client";
 
 const cards = ref([]);
 const newTitle = ref("");
@@ -7,35 +11,195 @@ const newContent = ref("");
 const editingId = ref(null);
 let db;
 
-// Initialiser IndexedDB
+const isOnline = ref(navigator.onLine);
+const isSyncing = ref(false);
+const locationText = ref("Position inconnue");
+const weatherText = ref("Météo inconnue");
+let map = null;
+const socket = io("http://localhost:3000");
+
+const getLocation = () => {
+  if (!navigator.geolocation) {
+    locationText.value = "GPS non supporté";
+    return;
+  }
+
+  navigator.geolocation.getCurrentPosition(async (position) => {
+    const { latitude, longitude } = position.coords;
+
+    locationText.value = `📍 ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+
+    await nextTick();
+    initMap(latitude, longitude);
+    fetchWeather(latitude, longitude);
+  });
+};
+
+const initMap = (lat, lng) => {
+  if (map) {
+    map.remove();
+  }
+
+  map = L.map("map").setView([lat, lng], 13);
+
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap",
+  }).addTo(map);
+
+  L.marker([lat, lng])
+    .addTo(map)
+    .bindPopup("📍 Position du technicien")
+    .openPopup();
+};
+
+const fetchWeather = async (lat, lng) => {
+  try {
+    const res = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,weather_code`,
+    );
+
+    const data = await res.json();
+
+    weatherText.value = `🌤️ ${data.current.temperature_2m}°C`;
+  } catch {
+    weatherText.value = "🌧️ météo indisponible";
+  }
+};
+
+socket.on("card-added", (card) => {
+  const exists = cards.value.some((c) => String(c.id) === String(card.id));
+  if (!exists) cards.value.push(card);
+});
+
+socket.on("card-updated", (updated) => {
+  const index = cards.value.findIndex(
+    (c) => String(c.id) === String(updated.id),
+  );
+  if (index !== -1) cards.value[index] = updated;
+});
+
+socket.on("card-deleted", (id) => {
+  cards.value = cards.value.filter((c) => String(c.id) !== String(id));
+});
+
 const initDB = () => {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open("DashboardDB", 1);
 
     request.onupgradeneeded = (event) => {
       db = event.target.result;
-      db.createObjectStore("cards", { keyPath: "id", autoIncrement: true });
+
+      if (!db.objectStoreNames.contains("cards")) {
+        if (!db.objectStoreNames.contains("cards")) {
+          db.createObjectStore("cards", { keyPath: "id" });
+        }
+
+        if (!db.objectStoreNames.contains("pending")) {
+          db.createObjectStore("pending", {
+            keyPath: "id",
+            autoIncrement: true,
+          });
+        }
+      }
     };
 
     request.onsuccess = (event) => {
       db = event.target.result;
-      resolve(db);
+      resolve();
     };
 
-    request.onerror = (event) => reject(event);
+    request.onerror = reject;
   });
 };
 
-// Sauvegarder données
+const waitForRequest = (request) =>
+  new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+
+const waitForTransaction = (tx) =>
+  new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () =>
+      reject(tx.error || new Error("IndexedDB transaction aborted"));
+  });
+
+const syncPendingChanges = async () => {
+  isSyncing.value = true;
+
+  try {
+    const pendingActions = await new Promise((resolve, reject) => {
+      const tx = db.transaction(["pending"], "readonly");
+      const store = tx.objectStore("pending");
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+
+    for (const action of pendingActions) {
+      try {
+        if (action.type === "add") {
+          const res = await fetch("http://localhost:3000/api/cards", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(action.data),
+          });
+
+          const savedCard = await res.json();
+
+          const tx2 = db.transaction("cards", "readwrite");
+          const store2 = tx2.objectStore("cards");
+          store2.delete(action.data.id);
+          store2.put(savedCard);
+          await waitForTransaction(tx2);
+
+          cards.value = cards.value.filter((c) => c.id !== action.data.id);
+          if (!cards.value.some((c) => c.id === savedCard.id)) {
+            cards.value.push(savedCard);
+          }
+        }
+
+        if (action.type === "update") {
+          await fetch(`http://localhost:3000/api/cards/${action.data.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(action.data),
+          });
+        }
+
+        if (action.type === "delete") {
+          await fetch(`http://localhost:3000/api/cards/${action.data.id}`, {
+            method: "DELETE",
+          });
+        }
+
+        const tx3 = db.transaction(["pending"], "readwrite");
+        const store3 = tx3.objectStore("pending");
+        store3.delete(action.id);
+        await waitForTransaction(tx3);
+      } catch (error) {
+        console.log("Toujours offline", error);
+        break;
+      }
+    }
+
+    await fetchData();
+  } finally {
+    isSyncing.value = false;
+  }
+};
+
 const saveToDB = (data) => {
   const tx = db.transaction("cards", "readwrite");
   const store = tx.objectStore("cards");
 
-  store.clear(); // éviter doublons
-  data.forEach((item) => store.add(item));
+  store.clear();
+  data.forEach((item) => store.put(item));
 };
 
-// Lire données
 const getFromDB = () => {
   return new Promise((resolve) => {
     const tx = db.transaction("cards", "readonly");
@@ -46,98 +210,149 @@ const getFromDB = () => {
   });
 };
 
-// Fetch + fallback offline
 const fetchData = async () => {
   try {
     const res = await fetch("http://localhost:3000/api/cards");
-    const data = await res.json();
-
-    cards.value = data;
-    saveToDB(data);
-
-    console.log(" Données depuis API");
-  } catch (error) {
-    console.log(" Offline → chargement depuis IndexedDB");
+    const apiData = await res.json();
 
     const localData = await getFromDB();
-    cards.value = localData;
+    const tempCards = localData.filter(
+      (card) => typeof card.id === "string" && card.id.startsWith("temp-"),
+    );
+
+    const merged = [...apiData];
+
+    tempCards.forEach((tempCard) => {
+      if (!merged.some((c) => String(c.id) === String(tempCard.id))) {
+        merged.push(tempCard);
+      }
+    });
+
+    cards.value = merged;
+    saveToDB(merged);
+
+    console.log("✅ API + fusion local");
+  } catch {
+    console.log("⚠️ Offline → IndexedDB");
+    cards.value = await getFromDB();
   }
 };
 
-// Ajouter une carte
 const addCard = async () => {
-  if (!newTitle.value.trim() || !newContent.value.trim()) {
-    alert("Veuillez remplir le titre et la description");
-    return;
-  }
+  const newCard = {
+    id: "temp-" + Date.now(),
+    title: newTitle.value,
+    content: newContent.value,
+  };
 
-  await fetch("http://localhost:3000/api/cards", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      title: newTitle.value,
-      content: newContent.value,
-    }),
-  });
+  try {
+    await fetch("http://localhost:3000/api/cards", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(newCard),
+    });
+
+    await fetchData();
+  } catch {
+    const tx = db.transaction(["cards", "pending"], "readwrite");
+
+    tx.objectStore("cards").put(newCard);
+
+    tx.objectStore("pending").add({
+      type: "add",
+      data: newCard,
+    });
+
+    cards.value.push(newCard);
+  }
 
   newTitle.value = "";
   newContent.value = "";
-  fetchData();
 };
 
-// Supprimer une carte
+const updateCard = async (id) => {
+  const updatedCard = {
+    id,
+    title: newTitle.value,
+    content: newContent.value,
+  };
+
+  try {
+    await fetch(`http://localhost:3000/api/cards/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updatedCard),
+    });
+
+    await fetchData();
+  } catch {
+    const tx = db.transaction(["cards", "pending"], "readwrite");
+
+    tx.objectStore("cards").put(updatedCard);
+    tx.objectStore("pending").add({
+      type: "update",
+      data: updatedCard,
+    });
+
+    const index = cards.value.findIndex((c) => c.id === id);
+    if (index !== -1) cards.value[index] = updatedCard;
+  }
+
+  cancelEdit();
+};
+
 const deleteCard = async (id) => {
-  await fetch(`http://localhost:3000/api/cards/${id}`, {
-    method: "DELETE",
-  });
+  try {
+    await fetch(`http://localhost:3000/api/cards/${id}`, {
+      method: "DELETE",
+    });
 
-  fetchData();
+    await fetchData();
+  } catch {
+    const tx = db.transaction(["cards", "pending"], "readwrite");
+
+    tx.objectStore("cards").delete(id);
+    tx.objectStore("pending").add({
+      type: "delete",
+      data: { id },
+    });
+
+    cards.value = cards.value.filter((card) => card.id !== id);
+  }
 };
 
-// Démarrer l'édition
 const startEdit = (card) => {
   editingId.value = card.id;
   newTitle.value = card.title;
   newContent.value = card.content;
 };
 
-// Annuler l'édition
 const cancelEdit = () => {
   editingId.value = null;
   newTitle.value = "";
   newContent.value = "";
 };
 
-// Modifier une carte
-const updateCard = async (id) => {
-  if (!newTitle.value.trim() || !newContent.value.trim()) {
-    alert("Veuillez remplir le titre et la description");
-    return;
-  }
-
-  await fetch(`http://localhost:3000/api/cards/${id}`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      title: newTitle.value,
-      content: newContent.value,
-    }),
-  });
-
-  editingId.value = null;
-  newTitle.value = "";
-  newContent.value = "";
-  fetchData();
+const updateNetworkStatus = () => {
+  isOnline.value = navigator.onLine;
 };
-
-//  Au démarrage
 onMounted(async () => {
   await initDB();
-  fetchData();
+  await fetchData();
+  getLocation();
+
+  window.addEventListener("online", async () => {
+    isOnline.value = true;
+    await syncPendingChanges();
+  });
+
+  window.addEventListener("offline", () => {
+    isOnline.value = false;
+  });
+
+  if (isOnline.value) {
+    await syncPendingChanges();
+  }
 });
 </script>
 
@@ -145,12 +360,30 @@ onMounted(async () => {
   <div class="container">
     <h1>Dashboard</h1>
 
+    <div class="status-bar">
+      <span :class="isOnline ? 'badge online' : 'badge offline'">
+        {{ isOnline ? "🟢 Online" : "🔴 Offline" }}
+      </span>
+
+      <span class="badge sync" v-if="isSyncing"> 🔄 Synchronisation... </span>
+
+      <span class="badge location">
+        {{ locationText }}
+      </span>
+
+      <span class="badge weather">
+        {{ weatherText }}
+      </span>
+    </div>
+
+    <div id="map" class="map-box"></div>
+
     <div class="header-actions">
       <button @click="fetchData">Refresh</button>
     </div>
 
     <!-- Formulaire d'ajout -->
-    <div class="form-section">
+    <div v-if="!editingId" class="form-section">
       <h3>➕ Ajouter une nouvelle carte</h3>
       <input
         v-model="newTitle"
@@ -181,7 +414,7 @@ onMounted(async () => {
       </div>
 
       <!-- Affichage des cartes -->
-      <div v-for="(card, index) in cards" :key="index" class="card">
+      <div v-for="card in cards" :key="card.id" class="card">
         <div class="card-header">
           <div>
             <h2>{{ card.title }}</h2>
@@ -208,7 +441,7 @@ onMounted(async () => {
         style="grid-column: 1 / -1; text-align: center; padding: 40px 20px"
       >
         <p style="color: var(--secondary); font-size: 1.1rem">
-          Aucune carte pour le moment. Commencez par en ajouter une ! 🚀
+          Aucune carte pour le moment. Commencez par en ajouter une !
         </p>
       </div>
     </div>
@@ -274,6 +507,55 @@ h3 {
   font-size: 1.125rem;
   margin-bottom: 16px;
   font-weight: 600;
+}
+
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.badge {
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.online {
+  background: #dcfce7;
+}
+
+.offline {
+  background: #fee2e2;
+}
+
+.sync {
+  background: #dbeafe;
+}
+
+.location {
+  background: #f1f5f9;
+}
+
+.weather {
+  background: #eef2ff;
+}
+
+.map-box {
+  width: 100%;
+  min-height: 320px;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  margin-bottom: 24px;
+}
+
+#map {
+  width: 100%;
+  height: 100%;
+  min-height: 320px;
 }
 
 /* Bouton principal */
